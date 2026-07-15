@@ -28,7 +28,11 @@ import type { LogLevelOption } from '../log/logging';
 import { error, logPluginError } from '../log/logs';
 import type { InputOptions } from '../options/input-options';
 import type { OutputOptions } from '../options/output-options';
-import { bindingifyCloseWatcher, bindingifyWatchChange } from './bindingify-watch-hooks';
+import {
+  bindingifyCloseWatcher,
+  bindingifyHotUpdate,
+  bindingifyWatchChange,
+} from './bindingify-watch-hooks';
 import { extractHookUsage } from './generated/hook-usage';
 import type { Plugin, RolldownPlugin } from './index';
 import type { PluginContextData } from './plugin-context-data';
@@ -117,6 +121,8 @@ export function bindingifyPlugin(
 
   const { plugin: watchChange, meta: watchChangeMeta } = bindingifyWatchChange(args);
 
+  const { plugin: hotUpdate, meta: hotUpdateMeta } = bindingifyHotUpdate(args);
+
   const { plugin: closeWatcher, meta: closeWatcherMeta } = bindingifyCloseWatcher(args);
   let hookUsage = extractHookUsage(plugin).inner();
   const result: BindingPluginOptions = {
@@ -165,6 +171,8 @@ export function bindingifyPlugin(
     outroMeta,
     watchChange,
     watchChangeMeta,
+    hotUpdate,
+    hotUpdateMeta,
     closeWatcher,
     closeWatcherMeta,
     hookUsage,
@@ -193,6 +201,7 @@ function wrapHandlers(plugin: BindingPluginOptions): BindingPluginOptions {
     'intro',
     'outro',
     'watchChange',
+    'hotUpdate',
     'closeWatcher',
   ] as const) {
     const handler = plugin[hookName] as any;

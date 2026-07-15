@@ -1,3 +1,4 @@
+import fs from 'node:fs/promises';
 import type { BindingPluginOptions } from '../binding.cjs';
 import { normalizeHook } from '../utils/normalize-hook';
 import type { BindingifyPluginArgs } from './bindingify-plugin';
@@ -7,6 +8,40 @@ import {
 } from './bindingify-plugin-hook-meta';
 import type { ChangeEvent } from './index';
 import { PluginContextImpl } from './plugin-context';
+
+export function bindingifyHotUpdate(
+  args: BindingifyPluginArgs,
+): PluginHookWithBindingExt<BindingPluginOptions['hotUpdate']> {
+  const hook = args.plugin.hotUpdate;
+  if (!hook) {
+    return {};
+  }
+  const { handler, meta } = normalizeHook(hook);
+
+  return {
+    plugin: async (ctx, hookArgs) => {
+      const result = await handler.call(
+        new PluginContextImpl(
+          args.outputOptions,
+          ctx,
+          args.plugin,
+          args.pluginContextData,
+          args.onLog,
+          args.logLevel,
+          args.watchMode,
+        ),
+        {
+          type: hookArgs.kind as ChangeEvent,
+          file: hookArgs.file,
+          modules: hookArgs.modules,
+          read: () => fs.readFile(hookArgs.file, 'utf-8'),
+        },
+      );
+      return result ?? undefined;
+    },
+    meta: bindingifyPluginHookMeta(meta),
+  };
+}
 
 export function bindingifyWatchChange(
   args: BindingifyPluginArgs,

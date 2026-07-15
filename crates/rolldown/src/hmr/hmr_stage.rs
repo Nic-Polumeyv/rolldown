@@ -71,6 +71,21 @@ impl<Fs: FileSystem + Clone + 'static> DerefMut for HmrStage<'_, Fs> {
   }
 }
 
+/// Upper bound for one file's `hotUpdate` plugin chain. A hung hook would otherwise stall the
+/// HMR task — and `DevEngine::close()` with it, since close waits for the running task.
+#[cfg(not(target_family = "wasm"))]
+const HOT_UPDATE_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Module ids the `hotUpdate` hook must not see or return: lazy-compilation proxies are internal
+/// artifacts (cf. the dynamic-importer exclusion in `EcmaView`) and runtime modules are never
+/// re-fetched. Runtime ids use both prefixes (cf. the same pair in `ChunkGraph`); the `\0` one
+/// covers `RUNTIME_MODULE_KEY`.
+fn is_hidden_from_hot_update_hook(id: &str) -> bool {
+  id.contains("?rolldown-lazy=")
+    || id.starts_with("rolldown:")
+    || id.starts_with("\0rolldown/")
+}
+
 impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
   pub fn new(input: HmrStageInput<'a, Fs>) -> Self {
     Self { input }
@@ -88,28 +103,90 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
       clients.iter().map(|c| c.client_id).collect::<Vec<_>>(),
     );
 
-    // 1. Identify changed modules
+    // 1. Identify changed modules — per changed file: compute the default affected set, then (if
+    // any plugin registered `hotUpdate`) let the plugin replace-chain edit it before re-fetching.
+    let hot_update_hook_registered = self.plugin_driver.has_hot_update_hook();
     let mut changed_modules = FxIndexSet::default();
     for (changed_file_path, event) in changed_file_paths {
       let changed_file_path = ArcStr::from(changed_file_path.to_slash());
-      // Check if the file itself is a module
-      if let Some(module_idx) = self.cache.module_idx_by_abs_path.get(&changed_file_path) {
-        if *event == WatcherChangeKind::Delete {
-          if let Some(importers) = self.cache.importers.get(*module_idx) {
-            changed_modules.extend(importers.iter().map(|imp| imp.importer_idx));
-          }
-        } else {
-          changed_modules.insert(*module_idx);
+
+      // Default affected set: the file's own module (kept even for deletes — the hook contract
+      // passes the deleted module itself; importer expansion happens after the chain) plus every
+      // module that has this file as a transform dependency.
+      let own_module_idx = self.cache.module_idx_by_abs_path.get(&changed_file_path).copied();
+      let mut affected_modules = FxIndexSet::default();
+      if let Some(module_idx) = own_module_idx {
+        affected_modules.insert(module_idx);
+      }
+      for entry in self.plugin_driver.transform_dependencies.iter() {
+        let module_idx = *entry.key();
+        if entry.value().contains(&changed_file_path) {
+          affected_modules.insert(module_idx);
         }
       }
 
-      // Check if any modules have this file as a transform dependency
-      for entry in self.plugin_driver.transform_dependencies.iter() {
-        let module_idx = *entry.key();
-        let deps = entry.value();
-        if deps.contains(&changed_file_path) {
+      if hot_update_hook_registered {
+        // Plugins receive raw module ids and may replace the set; an empty return suppresses
+        // this file's update. The chain also runs when the default set is empty — content
+        // plugins claim files no module maps to. Ids the graph doesn't know are dropped.
+        let default_ids = affected_modules
+          .iter()
+          .filter_map(|module_idx| match &self.module_table().modules[*module_idx] {
+            Module::Normal(module) if !is_hidden_from_hot_update_hook(module.id.as_arc_str()) => {
+              Some(module.id.as_arc_str().clone())
+            }
+            _ => None,
+          })
+          .collect::<Vec<_>>();
+        let hook_future = self.plugin_driver.hot_update(*event, &changed_file_path, default_ids);
+        #[cfg(not(target_family = "wasm"))]
+        let final_ids =
+          tokio::time::timeout(HOT_UPDATE_HOOK_TIMEOUT, hook_future).await.map_err(|_| {
+            anyhow::anyhow!(
+              "hotUpdate hook timed out after {}s for file {changed_file_path}",
+              HOT_UPDATE_HOOK_TIMEOUT.as_secs()
+            )
+          })??;
+        #[cfg(target_family = "wasm")]
+        let final_ids = hook_future.await?;
+        affected_modules.clear();
+        for id in final_ids {
+          if is_hidden_from_hot_update_hook(&id) {
+            continue;
+          }
+          // The map keys are `to_slash`ed module ids while hook ids are raw — without the same
+          // normalization here, raw Windows ids would never round-trip back to their modules.
+          if let Some(module_idx) = self.cache.module_idx_by_abs_path.get(&*id.to_slash()) {
+            affected_modules.insert(*module_idx);
+          } else {
+            tracing::debug!(
+              "[HmrStage] dropped unknown module id returned from the hotUpdate hook: {id}"
+            );
+          }
+        }
+      }
+
+      for module_idx in affected_modules {
+        if *event == WatcherChangeKind::Delete && Some(module_idx) == own_module_idx {
+          // A deleted module cannot be re-fetched — start the update from its importers.
+          if let Some(importers) = self.cache.importers.get(module_idx) {
+            changed_modules.extend(importers.iter().map(|imp| imp.importer_idx));
+          }
+        } else {
           changed_modules.insert(module_idx);
         }
+      }
+    }
+
+    // Files re-queued by an earlier failed scan (`pending_rescans`) get
+    // re-fetched and merged by this update as well. Treat them as changed so
+    // their recovered content reaches the clients' patches; otherwise only
+    // the server-side graph would learn about their edits. This runs before
+    // the Noop early-return so a hook that suppresses an update cannot starve
+    // the recovery.
+    for resolved_id in &self.cache.pending_rescans {
+      if let Some(state) = self.cache.module_id_to_idx.get(&resolved_id.id) {
+        changed_modules.insert(state.idx());
       }
     }
 
@@ -131,16 +208,6 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
           })
           .collect(),
       );
-    }
-
-    // Files re-queued by an earlier failed scan (`pending_rescans`) get
-    // re-fetched and merged by this update as well. Treat them as changed so
-    // their recovered content reaches the clients' patches; otherwise only
-    // the server-side graph would learn about their edits.
-    for resolved_id in &self.cache.pending_rescans {
-      if let Some(state) = self.cache.module_id_to_idx.get(&resolved_id.id) {
-        changed_modules.insert(state.idx());
-      }
     }
 
     // 1. Do ONE module refetch and cache merge — the update-superset walk (which
@@ -805,5 +872,19 @@ impl<Fs: FileSystem + Clone + 'static> HmrStage<'_, Fs> {
         }
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::is_hidden_from_hot_update_hook;
+
+  #[test]
+  fn hidden_ids_cover_runtime_and_lazy_proxy_modules() {
+    assert!(is_hidden_from_hot_update_hook(rolldown_common::RUNTIME_MODULE_KEY));
+    assert!(is_hidden_from_hot_update_hook("rolldown:hmr"));
+    assert!(is_hidden_from_hot_update_hook("/app/main.js?rolldown-lazy=1"));
+    assert!(!is_hidden_from_hot_update_hook("/app/main.js"));
+    assert!(!is_hidden_from_hot_update_hook("\0virtual:team"));
   }
 }
